@@ -1,0 +1,188 @@
+import os 
+import pandas as pd
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from sklearn.model_selection import train_test_split
+
+# GPU/CPU auswählen
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Pfade
+image_folder = '/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/images/image_dataset'
+csv_path = '/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/miccai2023_nih-cxr-lt_labels_train.csv'
+filtered_labels_path = '/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/filtered_labels.csv'
+
+# Labels filtern
+uploaded_images = set()
+for root, dirs, files in os.walk(image_folder):
+    for file in files:
+        if file.endswith('.png'):
+            uploaded_images.add(file.lower())  # Nur den Dateinamen speichern und in lowercase umwandeln
+
+labels_df = pd.read_csv(csv_path)
+labels_df['id_no_ext'] = labels_df['id'].str.replace('.png', '', regex=False).str.strip().str.lower()
+uploaded_images_no_ext = {os.path.splitext(img)[0] for img in uploaded_images}
+
+# Labels filtern: Nur gemeinsame IDs behalten
+filtered_labels = labels_df[labels_df['id_no_ext'].isin(uploaded_images_no_ext)]
+filtered_labels = filtered_labels.drop(columns=['id_no_ext'])  # Temporäre Spalte entfernen
+
+# Gefilterte Labels speichern
+filtered_labels.to_csv(filtered_labels_path, index=False)
+print(f"Gefilterte Labels wurden gespeichert in: {filtered_labels_path}")
+print(f"Anzahl der gefilterten Labels: {(len(filtered_labels))}")
+
+# Trainings- und Validierungsdaten aufteilen
+train_labels, val_labels = train_test_split(filtered_labels, test_size=0.2, random_state=42)
+train_labels.to_csv('/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/train_labels.csv', index=False)
+val_labels.to_csv('/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/val_labels.csv', index=False)
+
+# Dataset-Klasse
+class ChestXRayDataset(Dataset):
+    def __init__(self, image_folder, label_file, transform=None):
+        self.image_folder = image_folder
+        self.labels_df = pd.read_csv(label_file)
+        self.transform = transform
+
+        self.disease_columns = [
+            "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
+            "Mass", "Nodule", "Pneumonia", "Pneumothorax",
+            "Consolidation", "Edema", "Emphysema", "Fibrosis",
+            "Pleural Thickening", "Hernia"
+        ]
+
+        missing_columns = [col for col in self.disease_columns if col not in self.labels_df.columns]
+        if missing_columns:
+            raise ValueError(f"Fehlende Spalten in der CSV: {missing_columns}")
+
+    def __len__(self):
+        return len(self.labels_df)
+
+    def __getitem__(self, idx):
+        row = self.labels_df.iloc[idx]
+        img_name = row['id']
+        img_path = None
+
+        for root, _, files in os.walk(self.image_folder):
+            if img_name in files:
+                img_path = os.path.join(root, img_name)
+                break
+
+        if img_path is None:
+            raise FileNotFoundError(f"Bild {img_name} nicht gefunden!")
+
+        labels = row[self.disease_columns].values.astype('float32')
+
+        image = Image.open(img_path).convert('L')
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(labels)
+
+# Transformationen und DataLoader
+Transformator = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((512, 512)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+train_dataset = ChestXRayDataset(image_folder=image_folder, label_file='/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/train_labels.csv', transform=Transformator)
+val_dataset = ChestXRayDataset(image_folder=image_folder, label_file='/home/martinasc/GraphTsetlinMachine/BigAssignmentNN/val_labels.csv', transform=Transformator)
+
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False)
+
+print(f"Anzahl der Trainingsdaten: {(len(train_dataset))}")
+print(f"Anzahl der Validierungsdaten: {(len(val_dataset))}")
+
+# CNN-Modell
+class CNNModel(nn.Module):
+    def __init__(self):
+        super(CNNModel, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 64 * 128, 512),
+            nn.Linear(512, 14),
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.fc(x)
+        return x
+
+model = CNNModel().to(device)
+
+# Loss
+criterion = nn.BCEWithLogitsLoss()
+
+# Validierungsfunktion
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            predictions = (outputs > 0.5).float()
+            correct += (predictions == labels).sum().item()
+            total += labels.numel()
+
+    avg_loss = total_loss / len(val_loader)
+    accuracy = 100 * correct / total
+    return avg_loss, accuracy
+
+# Training mit SPPS-Lernrate
+epochs = 5
+f_star = 0.1  # Geschätzter optimaler Verlust
+lambda_reg = 1e-6  # Regularisierungsterm
+
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+
+        # Vorwärtsdurchlauf
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        running_loss += loss.item()
+
+        # Berechne SPPS-Schrittgröße
+        grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True, create_graph=True)
+        step_size = (loss.item() - f_star) / (sum(g.norm()**2 for g in grads) + lambda_reg)
+
+        # Aktualisiere Parameter manuell
+        with torch.no_grad():
+            for param, grad in zip(model.parameters(), grads):
+                param -= step_size * grad
+
+    avg_loss = running_loss / len(train_loader)
+    print(f'Epoch {epoch+1}, Training Loss: {avg_loss}')
+
+    # Validierung
+    val_loss, val_accuracy = validate(model, val_loader, criterion, device)
+    print(f'Epoch {epoch+1}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%')
+
+print('Training abgeschlossen.')
